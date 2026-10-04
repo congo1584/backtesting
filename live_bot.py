@@ -1,13 +1,13 @@
-"""Bot en vivo (demo) para la estrategia return-first v8.1.
+"""Bot en vivo (demo) para la estrategia return-first v8 DIARIA (min 28 dias).
 
 Reutiliza SIN CAMBIOS la lógica de backtester_batch.py (indicadores, señal,
 stops, break-even), así lo que corre en vivo es lo mismo que se backtesteó.
 
 Ejecución: cron cada hora ->  python live_bot.py
 - Cada hora: revisa stop duro y break-even con el precio actual.
-- Una vez por semana (domingo, primera ejecución tras las 00:00 UTC del
-  domingo): salida por régimen, ejecuta la decisión pendiente y genera la
-  nueva, igual que el backtest (decisión semana t, ejecución semana t+1).
+- Una vez al día (primera ejecución tras las 00:00 UTC): arma break-even con
+  el cierre de ayer, salida por régimen, ejecuta la decisión pendiente y genera
+  la nueva, igual que el backtest diario (decisión día t, ejecución día t+1).
 
 Estado en state.json (sobrevive reinicios). Logs en logs/live_log.csv y
 logs/bot.log. Cartera de papel interna = fuente de verdad. Si hay claves de
@@ -149,9 +149,10 @@ def buy(st, symbol, price, reason, prices):
     qty = spend / price
     st["cash"] -= spend * (1 + COST)
     st["positions"][symbol] = {"quantity": qty, "avg_price": price, "highest_price": price,
-                               "held_weeks": 0, "breakeven_armed": False,
+                               "entry_date": today(), "breakeven_armed": False,
+                               "breakeven_pending": False,
                                "weight": bt.position_weight(symbol),
-                               "stop_level": price * (1 - bt.get_hard_stop_pct(symbol))}
+                               "stop_level": price * (1 - bt.hard_stop_pct(symbol))}
     ext = mirror_testnet("buy", symbol, qty)
     write_log({"utc": now_iso(), "action": "buy", "symbol": symbol, "price": price,
                "reason": reason, "trade_return_pct": "", "equity": round(equity(st, prices), 2),
@@ -164,26 +165,39 @@ def now_iso():
 
 
 # ---------------------------------------------------------------- ciclo
+def arm_breakeven(st, md):
+    """Igual que el backtester: si un CIERRE diario supera el trigger, el
+    break-even queda pendiente y se arma en la vela siguiente."""
+    trig = getattr(config, "BREAKEVEN_TRIGGER_PCT", None)
+    if not (getattr(config, "USE_BREAKEVEN_PROTECTION", False) and trig):
+        return
+    for s, p in st["positions"].items():
+        if p.get("breakeven_pending"):
+            p["breakeven_armed"], p["breakeven_pending"] = True, False
+        last = md[s].iloc[-1]
+        if last["date"] >= p["entry_date"] and float(last["close"]) >= p["avg_price"] * (1 + trig):
+            p["breakeven_pending"] = True
+
+
 def check_stops(st, prices):
-    """Igual que intraperiod_exit pero con el precio actual (cada hora)."""
+    """Stop duro / break-even con el precio actual (cada hora)."""
     for s in list(st["positions"]):
         p, px = st["positions"][s], prices[s]
         p["highest_price"] = max(p["highest_price"], px)
-        trig = getattr(config, "BREAKEVEN_TRIGGER_PCT", None)
-        if getattr(config, "USE_BREAKEVEN_PROTECTION", False) and trig and p["highest_price"] >= p["avg_price"] * (1 + trig):
-            p["breakeven_armed"] = True
         p["stop_level"] = bt.stop_level(p, s)
         if px <= p["stop_level"]:
             reason = "break-even" if p["breakeven_armed"] else "stop-loss"
             sell(st, s, px, reason, prices)
-            st["cooldown_until"][s] = bt.add_weeks(today(), config.COOLDOWN_WEEKS_AFTER_SL)
+            weeks = bt.cooldown_weeks_after_stop(s) if reason == "stop-loss" else 0
+            if weeks > 0:
+                st["cooldown_until"][s] = bt.add_weeks(today(), weeks)
 
 
 def today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def weekly(st, md, prices):
+def daily(st, md, prices):
     date = today()
     # 1. salida por régimen
     for s in list(st["positions"]):
@@ -196,8 +210,6 @@ def weekly(st, md, prices):
         for s in list(st["positions"]):
             sell(st, s, prices[s], f"rotacion a {pend['symbol']}", prices)
         buy(st, pend["symbol"], prices[pend["symbol"]], pend["reason"], prices)
-    for p in st["positions"].values():
-        p["held_weeks"] += 1
     # 3. nueva decisión determinista
     cur = next(iter(st["positions"]), "")
     d = bt.decide(md, date, cur, st["cooldown_until"], st["positions"].get(cur, {}))
@@ -212,12 +224,13 @@ def main():
     st = load_state()
     md = market_data()
     prices = {s: live_price(s, md) for s in config.ALLOWED_ASSETS}
+    day = today()
+    if st.get("last_day") != day:          # una vez por día UTC, con la vela de ayer cerrada
+        arm_breakeven(st, md)
     check_stops(st, prices)
-    now = datetime.now(timezone.utc)
-    week_id = now.strftime("%G-W%V")
-    if now.weekday() == 6 and st.get("last_week_id") != week_id:
-        weekly(st, md, prices)
-        st["last_week_id"] = week_id
+    if st.get("last_day") != day:
+        daily(st, md, prices)
+        st["last_day"] = day
     save_state(st)
     log.info("ok equity=%.2f cash=%.2f pos=%s", equity(st, prices), st["cash"], list(st["positions"]))
 
